@@ -104,22 +104,27 @@ func NewValidatorFromPath(bundlePath string, hostSpecific bool, platform string)
 
 // CheckAll checks all parts of runtime bundle
 func (v *Validator) CheckAll() error {
-	errs := errors.Join(
-		v.CheckJSONSchema(),
-		v.CheckPlatform(),
-		v.CheckRoot(),
-		v.CheckMandatoryFields(),
-		v.CheckSemVer(),
-		v.CheckMounts(),
-		v.CheckProcess(),
-		v.CheckLinux(),
-		v.CheckAnnotations(),
-	)
-	if v.platform == "linux" || v.platform == "solaris" {
-		errs = errors.Join(errs, v.CheckHooks())
+	checks := []func() error{
+		v.CheckJSONSchema,
+		v.CheckPlatform,
+		v.CheckRoot,
+		v.CheckMandatoryFields,
+		v.CheckSemVer,
+		v.CheckMounts,
+		v.CheckProcess,
+		v.CheckLinux,
+		v.CheckAnnotations,
 	}
-
-	return errs
+	if v.platform == "linux" || v.platform == "solaris" {
+		checks = append(checks, v.CheckHooks)
+	}
+	var errs []error
+	for _, check := range checks {
+		if err := check(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // JSONSchemaURL returns the URL for the JSON Schema specifying the
@@ -140,84 +145,75 @@ func JSONSchemaURL(version string) (url string, err error) {
 // CheckJSONSchema validates the configuration against the
 // runtime-spec JSON Schema, using the version of the schema that
 // matches the configuration's declared version.
-func (v *Validator) CheckJSONSchema() (errs error) {
+func (v *Validator) CheckJSONSchema() error {
 	logrus.Debugf("check JSON schema")
 
 	url, err := JSONSchemaURL(strings.TrimSuffix(v.spec.Version, "-dev"))
 	if err != nil {
-		errs = errors.Join(errs, err)
-		return errs
+		return err
 	}
 
 	schemaLoader := gojsonschema.NewReferenceLoader(url)
 	documentLoader := gojsonschema.NewGoLoader(v.spec)
 	result, err := gojsonschema.Validate(schemaLoader, documentLoader)
 	if err != nil {
-		errs = errors.Join(errs, err)
-		return errs
+		return err
 	}
 
 	if !result.Valid() {
+		var errs []error
 		for _, resultError := range result.Errors() {
-			errs = errors.Join(errs, errors.New(resultError.String()))
+			errs = append(errs, errors.New(resultError.String()))
 		}
+		return errors.Join(errs...)
 	}
 
-	return errs
+	return nil
 }
 
 // CheckRoot checks status of v.spec.Root
-func (v *Validator) CheckRoot() (errs error) {
+func (v *Validator) CheckRoot() error {
 	logrus.Debugf("check root")
 
 	if v.platform == "windows" {
 		if v.spec.Windows != nil && v.spec.Windows.HyperV != nil {
 			if v.spec.Root != nil {
-				errs = errors.Join(errs,
-					specerror.NewError(specerror.RootOnHyperVNotSet, fmt.Errorf("for Hyper-V containers, Root must not be set"), rspec.Version))
+				return specerror.NewError(specerror.RootOnHyperVNotSet, fmt.Errorf("for Hyper-V containers, Root must not be set"), rspec.Version)
 			}
-			return
+			return nil
 		} else if v.spec.Root == nil {
-			errs = errors.Join(errs,
-				specerror.NewError(specerror.RootOnWindowsRequired, fmt.Errorf("on Windows, for Windows Server Containers, Root is REQUIRED"), rspec.Version))
-			return
+			return specerror.NewError(specerror.RootOnWindowsRequired, fmt.Errorf("on Windows, for Windows Server Containers, Root is REQUIRED"), rspec.Version)
 		}
 	} else if v.spec.Root == nil {
-		errs = errors.Join(errs,
-			specerror.NewError(specerror.RootOnNonWindowsRequired, fmt.Errorf("on all other platforms, Root is REQUIRED"), rspec.Version))
-		return
+		return specerror.NewError(specerror.RootOnNonWindowsRequired, fmt.Errorf("on all other platforms, Root is REQUIRED"), rspec.Version)
 	}
 
+	var errs []error
 	if v.platform == "windows" {
 		matched, err := regexp.MatchString(`\\\\[?]\\Volume[{][a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}[}]\\`, v.spec.Root.Path)
 		if err != nil {
-			errs = errors.Join(errs, err)
+			errs = append(errs, err)
 		} else if !matched {
-			errs = errors.Join(errs,
-				specerror.NewError(specerror.RootPathOnWindowsGUID, fmt.Errorf("root.path is %q, but it MUST be a volume GUID path when target platform is windows", v.spec.Root.Path), rspec.Version))
+			errs = append(errs, specerror.NewError(specerror.RootPathOnWindowsGUID, fmt.Errorf("root.path is %q, but it MUST be a volume GUID path when target platform is windows", v.spec.Root.Path), rspec.Version))
 		}
 
 		if v.spec.Root.Readonly {
-			errs = errors.Join(errs,
-				specerror.NewError(specerror.RootReadonlyOnWindowsFalse, fmt.Errorf("root.readonly field MUST be omitted or false when target platform is windows"), rspec.Version))
+			errs = append(errs, specerror.NewError(specerror.RootReadonlyOnWindowsFalse, fmt.Errorf("root.readonly field MUST be omitted or false when target platform is windows"), rspec.Version))
 		}
 
-		return
+		return errors.Join(errs...)
 	}
 
 	absBundlePath, err := filepath.Abs(v.bundlePath)
 	if err != nil {
-		errs = errors.Join(errs, fmt.Errorf("unable to convert %q to an absolute path", v.bundlePath))
-		return
+		return fmt.Errorf("unable to convert %q to an absolute path", v.bundlePath)
 	}
 
 	if filepath.Base(v.spec.Root.Path) != "rootfs" {
-		errs = errors.Join(errs,
-			specerror.NewError(specerror.RootPathOnPosixConvention, fmt.Errorf("path name should be the conventional 'rootfs'"), rspec.Version))
+		errs = append(errs, specerror.NewError(specerror.RootPathOnPosixConvention, fmt.Errorf("path name should be the conventional 'rootfs'"), rspec.Version))
 	}
 
-	var rootfsPath string
-	var absRootPath string
+	var rootfsPath, absRootPath string
 	if filepath.IsAbs(v.spec.Root.Path) {
 		rootfsPath = v.spec.Root.Path
 		absRootPath = filepath.Clean(rootfsPath)
@@ -226,92 +222,93 @@ func (v *Validator) CheckRoot() (errs error) {
 		rootfsPath = filepath.Join(v.bundlePath, v.spec.Root.Path)
 		absRootPath, err = filepath.Abs(rootfsPath)
 		if err != nil {
-			errs = errors.Join(errs, fmt.Errorf("unable to convert %q to an absolute path", rootfsPath))
-			return
+			errs = append(errs, fmt.Errorf("unable to convert %q to an absolute path", rootfsPath))
+			return errors.Join(errs...)
 		}
 	}
 
 	if fi, err := os.Stat(rootfsPath); err != nil {
-		errs = errors.Join(errs,
-			specerror.NewError(specerror.RootPathExist, fmt.Errorf("cannot find the root path %q", rootfsPath), rspec.Version))
+		errs = append(errs, specerror.NewError(specerror.RootPathExist, fmt.Errorf("cannot find the root path %q", rootfsPath), rspec.Version))
 	} else if !fi.IsDir() {
-		errs = errors.Join(errs,
-			specerror.NewError(specerror.RootPathExist, fmt.Errorf("root.path %q is not a directory", rootfsPath), rspec.Version))
+		errs = append(errs, specerror.NewError(specerror.RootPathExist, fmt.Errorf("root.path %q is not a directory", rootfsPath), rspec.Version))
 	}
 
 	rootParent := filepath.Dir(absRootPath)
 	if absRootPath == string(filepath.Separator) || rootParent != absBundlePath {
-		errs = errors.Join(errs,
-			specerror.NewError(specerror.ArtifactsInSingleDir, fmt.Errorf("root.path is %q, but it MUST be a child of %q", v.spec.Root.Path, absBundlePath), rspec.Version))
+		errs = append(errs, specerror.NewError(specerror.ArtifactsInSingleDir, fmt.Errorf("root.path is %q, but it MUST be a child of %q", v.spec.Root.Path, absBundlePath), rspec.Version))
 	}
 
-	return
+	return errors.Join(errs...)
 }
 
 // CheckSemVer checks v.spec.Version
-func (v *Validator) CheckSemVer() (errs error) {
+func (v *Validator) CheckSemVer() error {
 	logrus.Debugf("check semver")
 
 	version := v.spec.Version
 	_, err := semver.Parse(version)
 	if err != nil {
-		errs = errors.Join(errs,
-			specerror.NewError(specerror.SpecVersionInSemVer, fmt.Errorf("%q is not valid SemVer: %s", version, err.Error()), rspec.Version))
+		return specerror.NewError(specerror.SpecVersionInSemVer, fmt.Errorf("%q is not valid SemVer: %s", version, err.Error()), rspec.Version)
 	}
 	if version != rspec.Version {
-		errs = errors.Join(errs, fmt.Errorf("validate currently only handles version %s, but the supplied configuration targets %s", rspec.Version, version))
+		return fmt.Errorf("validate currently only handles version %s, but the supplied configuration targets %s", rspec.Version, version)
 	}
 
-	return
+	return nil
 }
 
 // CheckHooks check v.spec.Hooks
-func (v *Validator) CheckHooks() (errs error) {
+func (v *Validator) CheckHooks() error {
 	logrus.Debugf("check hooks")
 
 	if v.platform != "linux" && v.platform != "solaris" {
-		errs = errors.Join(errs, fmt.Errorf("For %q platform, the configuration structure does not support hooks", v.platform))
-		return
+		return fmt.Errorf("for %q platform, the configuration structure does not support hooks", v.platform)
 	}
 
+	var errs []error
 	if v.spec.Hooks != nil {
-		errs = errors.Join(errs, v.checkEventHooks("prestart", v.spec.Hooks.Prestart, v.HostSpecific)) //nolint:staticcheck // Ignore SA1019: v.Spec.Hooks.Prestart is deprecated
-		errs = errors.Join(errs, v.checkEventHooks("poststart", v.spec.Hooks.Poststart, v.HostSpecific))
-		errs = errors.Join(errs, v.checkEventHooks("poststop", v.spec.Hooks.Poststop, v.HostSpecific))
+		if err := v.checkEventHooks("prestart", v.spec.Hooks.Prestart, v.HostSpecific); err != nil { //nolint:staticcheck // Ignore SA1019: v.Spec.Hooks.Prestart is deprecated
+			errs = append(errs, err)
+		}
+		if err := v.checkEventHooks("poststart", v.spec.Hooks.Poststart, v.HostSpecific); err != nil {
+			errs = append(errs, err)
+		}
+		if err := v.checkEventHooks("poststop", v.spec.Hooks.Poststop, v.HostSpecific); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
-	return
+	return errors.Join(errs...)
 }
 
-func (v *Validator) checkEventHooks(hookType string, hooks []rspec.Hook, hostSpecific bool) (errs error) {
+func (v *Validator) checkEventHooks(hookType string, hooks []rspec.Hook, hostSpecific bool) error {
+	var retErrs []error
 	for i, hook := range hooks {
+		var errs []error
 		if !osFilepath.IsAbs(v.platform, hook.Path) {
-			errs = errors.Join(errs,
-				specerror.NewError(
-					specerror.PosixHooksPathAbs,
-					fmt.Errorf("hooks.%s[%d].path %v: is not absolute path",
-						hookType, i, hook.Path),
-					rspec.Version))
+			errs = append(errs, specerror.NewError(specerror.PosixHooksPathAbs, fmt.Errorf("hooks.%s[%d].path %v: is not absolute path", hookType, i, hook.Path), rspec.Version))
 		}
 
 		if hostSpecific {
 			fi, err := os.Stat(hook.Path)
 			if err != nil {
-				errs = errors.Join(errs, fmt.Errorf("cannot find %s hook: %v", hookType, hook.Path))
-			}
-			if fi.Mode()&0o111 == 0 {
-				errs = errors.Join(errs, fmt.Errorf("the %s hook %v: is not executable", hookType, hook.Path))
+				errs = append(errs, fmt.Errorf("cannot find %s hook: %v", hookType, hook.Path))
+			} else if fi.Mode()&0o111 == 0 {
+				errs = append(errs, fmt.Errorf("the %s hook %v: is not executable", hookType, hook.Path))
 			}
 		}
 
 		for _, env := range hook.Env {
 			if !envValid(env) {
-				errs = errors.Join(errs, fmt.Errorf("env %q for hook %v is in the invalid form", env, hook.Path))
+				errs = append(errs, fmt.Errorf("env %q for hook %v is in the invalid form", env, hook.Path))
 			}
+		}
+		if err := errors.Join(errs...); err != nil {
+			retErrs = append(retErrs, err)
 		}
 	}
 
-	return
+	return errors.Join(retErrs...)
 }
 
 // CheckProcess checks v.spec.Process
